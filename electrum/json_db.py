@@ -29,28 +29,136 @@ import copy
 import threading
 from collections import defaultdict
 from typing import Dict, Optional, List, Tuple, Set, Iterable, NamedTuple, Sequence
+import binascii
 
 from . import util, bitcoin
-from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh
+from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh, PR_TYPE_ONCHAIN
 from .keystore import bip44_derivation
-from .transaction import Transaction, TxOutpoint
+from .transaction import Transaction, TxOutpoint, PartialTxOutput
 from .logging import Logger
+from .lnutil import LOCAL, REMOTE, FeeUpdate, UpdateAddHtlc, LocalConfig, RemoteConfig, Keypair, OnlyPubkeyKeypair, RevocationStore
+from .lnutil import ChannelConstraints, Outpoint, ShachainElement
+from .lnutil import StoredAttr
 
 # seed_version is now used for the version of the wallet file
 
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 22     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 23     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
 JsonDBJsonEncoder = util.MyEncoder
 
 
+def decodeAll(d, local):
+    for k, v in d.items():
+        if k.endswith("_basepoint") or k.endswith("_key"):
+            if local:
+                yield (k, Keypair(**dict(decodeAll(v, local))))
+            else:
+                yield (k, OnlyPubkeyKeypair(**dict(decodeAll(v, local))))
+        elif k in ["node_id", "channel_id", "short_channel_id", "pubkey", "privkey", "current_per_commitment_point", "next_per_commitment_point", "per_commitment_secret_seed", "current_commitment_signature", "current_htlc_signatures"] and v is not None:
+            yield (k, binascii.unhexlify(v))
+        else:
+            yield (k, v)
+
+
 class TxFeesValue(NamedTuple):
     fee: Optional[int] = None
     is_calculated_by_us: bool = False
     num_inputs: Optional[int] = None
+
+
+class StorageDict(dict):
+
+    def __init__(self, data, db):
+        self.db = db
+        # recursively convert dicts to storagedict
+        for k, v in list(data.items()):
+            self.__setitem__(k, v)
+
+    def convert_key(self, key):
+        # convert int, HTLCOwner to str
+        return str(int(key)) if isinstance(key, int) else key
+
+    def __setitem__(self, key, value):
+        key = self.convert_key(key)
+        is_new = key not in self
+        # early return to prevent unnecessary disk writes
+        if not is_new and self[key] == value:
+            return
+        v = self._convert_value(key, value) if isinstance(value, dict) else value
+        # set parent of StoredAttr
+        if isinstance(v, StoredAttr):
+            v.set_db(self.db)
+        # convert dict to StorageDict
+        if isinstance(v, dict):
+            if key in ['change_addresses', 'receiving_addresses']:
+                v = StoredList(v, self.db)
+            else:
+                v = StorageDict(v, self.db)
+        # set item
+        dict.__setitem__(self, key, v)
+        if self.db:
+            self.db.set_modified(True)
+
+    def __delitem__(self, key):
+        key = self.convert_key(key)
+        if self.db:
+            self.db.set_modified(True)
+        return dict.__delitem__(self, key)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return self.get_slice(key)
+        else:
+            key = self.convert_key(key)
+            return dict.__getitem__(self, key)
+
+    def __contains__(self, key):
+        key = self.convert_key(key)
+        return dict.__contains__(self, key)
+
+    def _convert_value(self, key, value):
+        if key == 'local_config':
+            v = LocalConfig(**dict(decodeAll(value, True)))
+        elif key == 'remote_config':
+            v = RemoteConfig(**dict(decodeAll(value, False)))
+        elif key == 'constraints':
+            v = ChannelConstraints(**value)
+        elif key == 'funding_outpoint':
+            v = Outpoint(**dict(decodeAll(value, False)))
+        elif key == 'verified_tx3':
+            v = dict((k, TxMinedInfo(*x)) for k, x in value.items())
+        elif key == 'transactions':
+            v = dict((k, Transaction(x)) for k, x in value.items())
+        elif key == 'adds':
+            v = dict((k, UpdateAddHtlc(*x)) for k, x in value.items())
+        elif key == 'fee_updates':
+            v = dict((k, FeeUpdate(**x)) for k, x in value.items())
+        elif key == 'tx_fees':
+            v = dict((k, TxFeesValue(*x)) for k, x in value.items())
+        elif key == 'prevout_by_scripthash':
+            v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in value.items())
+        elif key == 'buckets':
+            v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in value.items())
+        else:
+            v = value
+        return v
+
+class StoredList(StorageDict):
+
+    def append(self, addr):
+        self[len(self)] = addr
+
+    def get_slice(self, _slice):
+        n = len(self)
+        slice_start = _slice.start or 0
+        if slice_start < 0: slice_start = slice_start % n
+        slice_stop = _slice.stop or n
+        if slice_stop < 0: slice_stop = slice_stop % n
+        return [self[i] for i in range(slice_start, slice_stop)]
 
 
 class JsonDB(Logger):
@@ -93,8 +201,6 @@ class JsonDB(Logger):
         v = self.data.get(key)
         if v is None:
             v = default
-        else:
-            v = copy.deepcopy(v)
         return v
 
     @modifier
@@ -113,9 +219,6 @@ class JsonDB(Logger):
             self.data.pop(key)
             return True
         return False
-
-    def commit(self):
-        pass
 
     @locked
     def dump(self):
@@ -216,6 +319,7 @@ class JsonDB(Logger):
         self._convert_version_20()
         self._convert_version_21()
         self._convert_version_22()
+        self._convert_version_23()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
         self._after_upgrade_tasks()
@@ -515,6 +619,70 @@ class JsonDB(Logger):
 
         self.put('seed_version', 22)
 
+    def _convert_version_23(self):
+        if not self._is_upgrade_method_needed(22, 22):
+            return
+        channels = self.get('channels', [])
+        for c in channels:
+            # convert fee updates
+            log = c.get('log', {})
+            for sub in LOCAL, REMOTE:
+                l = log[str(int(sub))]['fee_updates']
+                d = {}
+                for i, fu in enumerate(l):
+                    d[str(i)] = {
+                        'rate':fu['rate'],
+                        'ctn_local':fu['ctns'][str(int(LOCAL))],
+                        'ctn_remote':fu['ctns'][str(int(REMOTE))]
+                    }
+                log[str(int(sub))]['fee_updates'] = d
+            # convert revocation store to dict
+            r = c['remote_config'].pop('revocation_store')
+            d = {}
+            for i in range(49):
+                v = r['buckets'][i]
+                if v is not None:
+                    d[str(i)] = v
+            r['buckets'] = d
+            c['revocation_store'] = r
+        # convert channels to dict
+        self.data['channels'] = { x['channel_id']: x for x in channels }
+        # convert addresses to dict. flatten structure.
+        wallet_type = self.get('wallet_type')
+        _addresses = self.data.pop('addresses', {})
+        if wallet_type == 'imported':
+            self.data['imported_addresses'] = _addresses
+        else:
+            receiving_addresses = {}
+            for i, addr in enumerate(_addresses.get('receiving', [])):
+                receiving_addresses[str(i)] = addr
+            self.data['receiving_addresses'] = receiving_addresses
+            change_addresses = {}
+            for i, addr in enumerate(_addresses.get('change', [])):
+                change_addresses[str(i)] = addr
+            self.data['change_addresses'] = change_addresses
+        # convert txi & txo
+        txi = self.get('txi', {})
+        for tx_hash, d in txi.items():
+            d2 = {}
+            for addr, l in d.items():
+                d2[addr] = {}
+                for ser, v in l:
+                    d2[addr][ser] = v
+            txi[tx_hash] = d2
+        self.data['txi'] = txi
+        txo = self.get('txo', {})
+        for tx_hash, d in txo.items():
+            d2 = {}
+            for addr, l in d.items():
+                d2[addr] = {}
+                for n, v, cb in l:
+                    d2[addr][str(n)] = (v, cb)
+            txo[tx_hash] = d2
+        self.data['txo'] = txo
+
+        self.data['seed_version'] = 23
+
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):
             return
@@ -606,12 +774,14 @@ class JsonDB(Logger):
     @locked
     def get_txi_addr(self, tx_hash, address) -> Iterable[Tuple[str, int]]:
         """Returns an iterable of (prev_outpoint, value)."""
-        return self.txi.get(tx_hash, {}).get(address, []).copy()
+        d = self.txi.get(tx_hash, {}).get(address, {})
+        return list(d.items())
 
     @locked
     def get_txo_addr(self, tx_hash, address) -> Iterable[Tuple[int, int, bool]]:
         """Returns an iterable of (output_index, value, is_coinbase)."""
-        return self.txo.get(tx_hash, {}).get(address, []).copy()
+        d = self.txo.get(tx_hash, {}).get(address, {})
+        return [(int(n), v, cb) for (n, (v, cb)) in d.items()]
 
     @modifier
     def add_txi_addr(self, tx_hash, addr, ser, v):
@@ -619,9 +789,8 @@ class JsonDB(Logger):
             self.txi[tx_hash] = {}
         d = self.txi[tx_hash]
         if addr not in d:
-            # note that as this is a set, we can ignore "duplicates"
-            d[addr] = set()
-        d[addr].add((ser, v))
+            d[addr] = {}
+        d[addr][ser] = v
 
     @modifier
     def add_txo_addr(self, tx_hash, addr, n, v, is_coinbase):
@@ -629,9 +798,8 @@ class JsonDB(Logger):
             self.txo[tx_hash] = {}
         d = self.txo[tx_hash]
         if addr not in d:
-            # note that as this is a set, we can ignore "duplicates"
-            d[addr] = set()
-        d[addr].add((n, v, is_coinbase))
+            d[addr] = {}
+        d[addr][n] = (v, is_coinbase)
 
     @locked
     def list_txi(self):
@@ -741,18 +909,11 @@ class JsonDB(Logger):
 
     @locked
     def get_verified_tx(self, txid):
-        if txid not in self.verified_tx:
-            return None
-        height, timestamp, txpos, header_hash = self.verified_tx[txid]
-        return TxMinedInfo(height=height,
-                           conf=None,
-                           timestamp=timestamp,
-                           txpos=txpos,
-                           header_hash=header_hash)
+        return self.verified_tx.get(txid)
 
     @modifier
     def add_verified_tx(self, txid, info):
-        self.verified_tx[txid] = (info.height, info.timestamp, info.txpos, info.header_hash)
+        self.verified_tx[txid] = info
 
     @modifier
     def remove_verified_tx(self, txid):
@@ -812,7 +973,7 @@ class JsonDB(Logger):
         self.tx_fees.pop(txid, None)
 
     @locked
-    def get_data_ref(self, name):
+    def get_dict(self, name):
         # Warning: interacts un-intuitively with 'put': certain parts
         # of 'data' will have pointers saved as separate variables.
         if name not in self.data:
@@ -874,46 +1035,32 @@ class JsonDB(Logger):
     def load_addresses(self, wallet_type):
         """ called from Abstract_Wallet.__init__ """
         if wallet_type == 'imported':
-            self.imported_addresses = self.get_data_ref('addresses')  # type: Dict[str, dict]
+            self.imported_addresses = self.get_dict('imported_addresses') # type: Dict[str, dict]
         else:
-            self.get_data_ref('addresses')
-            for name in ['receiving', 'change']:
-                if name not in self.data['addresses']:
-                    self.data['addresses'][name] = []
-            self.change_addresses = self.data['addresses']['change']
-            self.receiving_addresses = self.data['addresses']['receiving']
+            self.change_addresses = self.get_dict('change_addresses')
+            self.receiving_addresses = self.get_dict('receiving_addresses')
             self._addr_to_addr_index = {}  # type: Dict[str, Sequence[int]]  # key: address, value: (is_change, index)
-            for i, addr in enumerate(self.receiving_addresses):
-                self._addr_to_addr_index[addr] = (0, i)
-            for i, addr in enumerate(self.change_addresses):
-                self._addr_to_addr_index[addr] = (1, i)
+            for i, addr in self.receiving_addresses.items():
+                self._addr_to_addr_index[addr] = (0, int(i))
+            for i, addr in self.change_addresses.items():
+                self._addr_to_addr_index[addr] = (1, int(i))
 
     @profiler
     def _load_transactions(self):
+        self.data = StorageDict(self.data, self)
         # references in self.data
         # TODO make all these private
         # txid -> address -> set of (prev_outpoint, value)
-        self.txi = self.get_data_ref('txi')  # type: Dict[str, Dict[str, Set[Tuple[str, int]]]]
+        self.txi = self.get_dict('txi')                          # type: Dict[str, Dict[str, Set[Tuple[str, int]]]]
         # txid -> address -> set of (output_index, value, is_coinbase)
-        self.txo = self.get_data_ref('txo')  # type: Dict[str, Dict[str, Set[Tuple[int, int, bool]]]]
-        self.transactions = self.get_data_ref('transactions')   # type: Dict[str, Transaction]
-        self.spent_outpoints = self.get_data_ref('spent_outpoints')  # txid -> output_index -> next_txid
-        self.history = self.get_data_ref('addr_history')  # address -> list of (txid, height)
-        self.verified_tx = self.get_data_ref('verified_tx3')  # txid -> (height, timestamp, txpos, header_hash)
-        self.tx_fees = self.get_data_ref('tx_fees')  # type: Dict[str, TxFeesValue]
+        self.txo = self.get_dict('txo')                          # type: Dict[str, Dict[str, Set[Tuple[int, int, bool]]]]
+        self.transactions = self.get_dict('transactions')        # type: Dict[str, Transaction]
+        self.spent_outpoints = self.get_dict('spent_outpoints')  # txid -> output_index -> next_txid
+        self.history = self.get_dict('addr_history')             # address -> list of (txid, height)
+        self.verified_tx = self.get_dict('verified_tx3')         # txid -> (height, timestamp, txpos, header_hash)
+        self.tx_fees = self.get_dict('tx_fees')                  # type: Dict[str, TxFeesValue]
         # scripthash -> set of (outpoint, value)
-        self._prevouts_by_scripthash = self.get_data_ref('prevouts_by_scripthash')  # type: Dict[str, Set[Tuple[str, int]]]
-        # convert raw hex transactions to Transaction objects
-        for tx_hash, raw_tx in self.transactions.items():
-            self.transactions[tx_hash] = Transaction(raw_tx)
-        # convert txi, txo: list to set
-        for t in self.txi, self.txo:
-            for d in t.values():
-                for addr, lst in d.items():
-                    d[addr] = set([tuple(x) for x in lst])
-        # convert prevouts_by_scripthash: list to set, list to tuple
-        for scripthash, lst in self._prevouts_by_scripthash.items():
-            self._prevouts_by_scripthash[scripthash] = {(prevout, value) for prevout, value in lst}
+        self._prevouts_by_scripthash = self.get_dict('prevouts_by_scripthash')  # type: Dict[str, Set[Tuple[str, int]]]
         # remove unreferenced tx
         for tx_hash in list(self.transactions.keys()):
             if not self.get_txi_addresses(tx_hash) and not self.get_txo_addresses(tx_hash):
@@ -926,9 +1073,15 @@ class JsonDB(Logger):
                 if spending_txid not in self.transactions:
                     self.logger.info("removing unreferenced spent outpoint")
                     d.pop(prevout_n)
-        # convert tx_fees tuples to NamedTuples
-        for tx_hash, tuple_ in self.tx_fees.items():
-            self.tx_fees[tx_hash] = TxFeesValue(*tuple_)
+        # convert invoices
+        # TODO invoices being these contextual dicts even internally,
+        #      where certain keys are only present depending on values of other keys...
+        #      it's horrible. we need to change this, at least for the internal representation,
+        #      to something that can be typed.
+        self.invoices = self.get_dict('invoices')
+        for invoice_key, invoice in self.invoices.items():
+            if invoice.get('type') == PR_TYPE_ONCHAIN:
+                invoice['outputs'] = [PartialTxOutput.from_legacy_tuple(*output) for output in invoice.get('outputs')]
 
     @modifier
     def clear_history(self):

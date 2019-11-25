@@ -121,7 +121,6 @@ class WalletStorage(Logger):
             return
         if not self.db.modified():
             return
-        self.db.commit()
         s = self.encrypt_before_writing(self.db.dump())
         temp_path = "%s.tmp.%s" % (self.path, os.getpid())
         with open(temp_path, "w", encoding='utf-8') as f:
