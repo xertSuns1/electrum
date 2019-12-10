@@ -40,6 +40,7 @@ def ln_dummy_address():
 
 from .db import StoredAttr
 
+
 @attr.s
 class OnlyPubkeyKeypair(StoredAttr):
     pubkey = attr.ib(type=bytes)

@@ -353,6 +353,7 @@ class LNWallet(LNWorker):
         self.channels = {}
         channels = self.storage.db.get_dict("channels")
         for channel_id, c in channels.items():
+            assert c['local_config'].db is not None
             self.channels[bfh(channel_id)] = Channel(c, sweep_address=self.sweep_address, lnworker=self)
 
         # timestamps of opening and closing transactions

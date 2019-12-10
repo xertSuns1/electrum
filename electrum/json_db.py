@@ -29,6 +29,7 @@ import copy
 import threading
 from collections import defaultdict
 from typing import Dict, Optional, List, Tuple, Set, Iterable, NamedTuple, Sequence
+import jsonpatch
 import binascii
 
 from . import util, bitcoin
@@ -44,7 +45,7 @@ from .db import StorageDict, StorageList, JsonDB, locked, modifier
 
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 23     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 24     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
@@ -68,7 +69,8 @@ class WalletDB(JsonDB):
 
     def load_data(self, s):
         try:
-            self.data = json.loads(s)
+            data = json.loads('[' + s + ']')
+            self.data, patches = data[0], data[1:]
         except:
             try:
                 d = ast.literal_eval(s)
@@ -76,6 +78,7 @@ class WalletDB(JsonDB):
             except Exception as e:
                 raise IOError("Cannot read wallet file")
             self.data = {}
+            patches = []
             for key, value in d.items():
                 try:
                     json.dumps(key)
@@ -86,12 +89,18 @@ class WalletDB(JsonDB):
                 self.data[key] = value
         if not isinstance(self.data, dict):
             raise WalletFileException("Malformed wallet file (not dict)")
+        # apply patches
+        self.logger.info('found %d patches'%len(patches))
+        patch = jsonpatch.JsonPatch(patches)
+        self.data = patch.apply(self.data)
+        self.set_modified(True)
 
         if not self.manual_upgrades and self.requires_split():
             raise WalletFileException("This wallet has multiple accounts and must be split")
 
         if not self.requires_upgrade():
             self._after_upgrade_tasks()
+            assert self.pending_changes == []
         elif not self.manual_upgrades:
             self.upgrade()
 
@@ -162,6 +171,7 @@ class WalletDB(JsonDB):
         self._convert_version_21()
         self._convert_version_22()
         self._convert_version_23()
+        self._convert_version_24()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
         self._after_upgrade_tasks()
@@ -173,10 +183,9 @@ class WalletDB(JsonDB):
     def _convert_wallet_type(self):
         if not self._is_upgrade_method_needed(0, 13):
             return
-
         wallet_type = self.get('wallet_type')
         if wallet_type == 'btchip': wallet_type = 'ledger'
-        if self.get('keystore') or self.get('x1/') or wallet_type=='imported':
+        if self.get('keystore') or self.get('x1/') or self.get('x1') or wallet_type=='imported':
             return False
         assert not self.requires_split()
         seed_version = self.get_seed_version()
@@ -524,6 +533,17 @@ class WalletDB(JsonDB):
         self.data['txo'] = txo
 
         self.data['seed_version'] = 23
+
+    def _convert_version_24(self):
+        if not self._is_upgrade_method_needed(23, 23):
+            return
+
+        # convert keystore names
+        for key in list(self.data.keys()):
+            if key.endswith('/'):
+                self.data[key[:-1]] = self.data.pop(key)
+
+        self.data['seed_version'] = 24
 
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):
@@ -930,7 +950,8 @@ class WalletDB(JsonDB):
         self.invoices = self.get_dict('invoices')
         for invoice_key, invoice in self.invoices.items():
             if invoice.get('type') == PR_TYPE_ONCHAIN:
-                invoice['outputs'] = [PartialTxOutput.from_legacy_tuple(*output) for output in invoice.get('outputs')]
+                outputs = [PartialTxOutput.from_legacy_tuple(*output) for output in invoice.get('outputs')]
+                invoice.__setitem__('outputs', outputs, patch=False)
 
     @modifier
     def clear_history(self):

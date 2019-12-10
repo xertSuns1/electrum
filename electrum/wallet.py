@@ -362,6 +362,8 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
                 changed = True
         if changed:
             run_hook('set_label', self, name, text)
+            #self.storage.put('labels', self.labels)
+            self.storage.write()
         return changed
 
     def set_fiat_value(self, txid, ccy, text, fx, value_sat):
@@ -1706,7 +1708,8 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         self._update_password_for_keystore(old_pw, new_pw)
         encrypt_keystore = self.can_have_keystore_encryption()
         self.storage.set_keystore_encryption(bool(new_pw) and encrypt_keystore)
-        self.storage.write()
+        # rewrite the whole file after password upddate
+        self.storage._write()
 
     @abstractmethod
     def _update_password_for_keystore(self, old_pw: Optional[str], new_pw: Optional[str]) -> None:
@@ -1871,6 +1874,7 @@ class Imported_Wallet(Simple_Wallet):
         self.keystore = load_keystore(self.storage, 'keystore') if self.storage.get('keystore') else None
 
     def save_keystore(self):
+        #print('warning: save_keystore is deprecated')
         self.storage.put('keystore', self.keystore.dump())
 
     def can_import_address(self):
@@ -2301,9 +2305,9 @@ class Multisig_Wallet(Deterministic_Wallet):
     def load_keystore(self):
         self.keystores = {}
         for i in range(self.n):
-            name = 'x%d/'%(i+1)
+            name = 'x%d'%(i+1)
             self.keystores[name] = load_keystore(self.storage, name)
-        self.keystore = self.keystores['x1/']
+        self.keystore = self.keystores['x1']
         xtype = bip32.xpub_type(self.keystore.xpub)
         self.txin_type = 'p2sh' if xtype == 'standard' else xtype
 
@@ -2312,7 +2316,7 @@ class Multisig_Wallet(Deterministic_Wallet):
             self.storage.put(name, k.dump())
 
     def get_keystore(self):
-        return self.keystores.get('x1/')
+        return self.keystores.get('x1')
 
     def get_keystores(self):
         return [self.keystores[i] for i in sorted(self.keystores.keys())]
