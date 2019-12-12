@@ -63,6 +63,7 @@ class StorageDict(dict):
 
     def __init__(self, data, db, path):
         self.db = db
+        self.lock = self.db.lock if self.db else threading.RLock()
         self.path = path
         # recursively convert dicts to storagedict
         for k, v in list(data.items()):
@@ -72,6 +73,13 @@ class StorageDict(dict):
         # convert int, HTLCOwner to str
         return str(int(key)) if isinstance(key, int) else key
 
+    def modifier(func):
+        def wrapper(self, *args, **kwargs):
+            with self.lock:
+                return func(self, *args, **kwargs)
+        return wrapper
+
+    @modifier
     def __setitem__(self, key, v):
         key = self.convert_key(key)
         is_new = key not in self
@@ -94,11 +102,12 @@ class StorageDict(dict):
         if self.db:
             self.db.set_modified(True)
 
+    @modifier
     def __delitem__(self, key):
         key = self.convert_key(key)
+        dict.__delitem__(self, key)
         if self.db:
             self.db.set_modified(True)
-        return dict.__delitem__(self, key)
 
     def __getitem__(self, key):
         if isinstance(key, slice):
@@ -111,13 +120,16 @@ class StorageDict(dict):
         key = self.convert_key(key)
         return dict.__contains__(self, key)
 
+    @modifier
     def pop(self, key, v=_RaiseKeyError):
         key = self.convert_key(key)
+        if v is _RaiseKeyError:
+            r = dict.pop(self, key)
+        else:
+            r = dict.pop(self, key, v)
         if self.db:
             self.db.set_modified(True)
-        if v is _RaiseKeyError:
-            return dict.pop(self, key)
-        return dict.pop(self, key, v)
+        return r
 
     def get(self, key, default=None):
         key = self.convert_key(key)
