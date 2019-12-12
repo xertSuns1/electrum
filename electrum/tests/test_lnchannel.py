@@ -96,7 +96,7 @@ def create_channel_state(funding_txid, funding_index, funding_sat, is_initiator,
             'log': {},
             'revocation_store': {},
     }
-    return StorageDict(state, None)
+    return StorageDict(state, None, [])
 
 def bip32(sequence):
     node = bip32_utils.BIP32Node.from_rootseed(b"9dk", xtype='standard').subkey_at_private_derivation(sequence)

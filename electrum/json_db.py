@@ -51,19 +51,6 @@ FINAL_SEED_VERSION = 23     # electrum >= 2.7 will set this to prevent
 JsonDBJsonEncoder = util.MyEncoder
 
 
-def decodeAll(d, local):
-    for k, v in d.items():
-        if k.endswith("_basepoint") or k.endswith("_key"):
-            if local:
-                yield (k, Keypair(**dict(decodeAll(v, local))))
-            else:
-                yield (k, OnlyPubkeyKeypair(**dict(decodeAll(v, local))))
-        elif k in ["node_id", "channel_id", "short_channel_id", "pubkey", "privkey", "current_per_commitment_point", "next_per_commitment_point", "per_commitment_secret_seed", "current_commitment_signature", "current_htlc_signatures"] and v is not None:
-            yield (k, binascii.unhexlify(v))
-        else:
-            yield (k, v)
-
-
 class TxFeesValue(NamedTuple):
     fee: Optional[int] = None
     is_calculated_by_us: bool = False
@@ -74,8 +61,9 @@ _RaiseKeyError = object() # singleton for no-default behavior
 
 class StorageDict(dict):
 
-    def __init__(self, data, db):
+    def __init__(self, data, db, path):
         self.db = db
+        self.path = path
         # recursively convert dicts to storagedict
         for k, v in list(data.items()):
             self.__setitem__(k, v)
@@ -84,22 +72,23 @@ class StorageDict(dict):
         # convert int, HTLCOwner to str
         return str(int(key)) if isinstance(key, int) else key
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key, v):
         key = self.convert_key(key)
         is_new = key not in self
         # early return to prevent unnecessary disk writes
-        if not is_new and self[key] == value:
+        if not is_new and self[key] == v:
             return
-        v = self._convert_value(key, value) if isinstance(value, dict) else value
+        # recursively convert dict to StorageDict.
+        # _convert_dict is called breadth-first
+        if isinstance(v, dict):
+            v = self._convert_dict(key, v)
+            v = StorageDict(v, self.db, self.path + [key])
+        # convert_value is called depth-first
+        if isinstance(v, dict) or isinstance(v, str):
+            v = self._convert_value(key, v)
         # set parent of StoredAttr
         if isinstance(v, StoredAttr):
             v.set_db(self.db)
-        # convert dict to StorageDict
-        if isinstance(v, dict):
-            if key in ['change_addresses', 'receiving_addresses']:
-                v = StoredList(v, self.db)
-            else:
-                v = StorageDict(v, self.db)
         # set item
         dict.__setitem__(self, key, v)
         if self.db:
@@ -134,32 +123,43 @@ class StorageDict(dict):
         key = self.convert_key(key)
         return dict.get(self, key, default)
 
-    def _convert_value(self, key, value):
-        if key == 'local_config':
-            v = LocalConfig(**dict(decodeAll(value, True)))
-        elif key == 'remote_config':
-            v = RemoteConfig(**dict(decodeAll(value, False)))
-        elif key == 'constraints':
-            v = ChannelConstraints(**value)
-        elif key == 'funding_outpoint':
-            v = Outpoint(**dict(decodeAll(value, False)))
-        elif key == 'transactions':
-            v = dict((k, Transaction(x)) for k, x in value.items())
+    def _convert_dict(self, key, v):
+        if key == 'transactions':
+            v = dict((k, Transaction(x)) for k, x in v.items())
         elif key == 'adds':
-            v = dict((k, UpdateAddHtlc(*x)) for k, x in value.items())
+            v = dict((k, UpdateAddHtlc(*x)) for k, x in v.items())
         elif key == 'fee_updates':
-            v = dict((k, FeeUpdate(**x)) for k, x in value.items())
+            v = dict((k, FeeUpdate(**x)) for k, x in v.items())
         elif key == 'tx_fees':
-            v = dict((k, TxFeesValue(*x)) for k, x in value.items())
+            v = dict((k, TxFeesValue(*x)) for k, x in v.items())
         elif key == 'prevout_by_scripthash':
-            v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in value.items())
+            v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in v.items())
         elif key == 'buckets':
-            v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in value.items())
-        else:
-            v = value
+            v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in v.items())
         return v
 
-class StoredList(StorageDict):
+    def _convert_value(self, key, v):
+        if key == 'local_config':
+            v = LocalConfig(**v)
+        elif key == 'remote_config':
+            v = RemoteConfig(**v)
+        elif key == 'constraints':
+            v = ChannelConstraints(**v)
+        elif key == 'funding_outpoint':
+            v = Outpoint(**v)
+        elif key.endswith("_basepoint") or key.endswith("_key"):
+            v = Keypair(**v) if len(v)==2 else OnlyPubkeyKeypair(**v)
+        elif key in [
+                "short_channel_id",
+                "current_per_commitment_point",
+                "next_per_commitment_point",
+                "per_commitment_secret_seed",
+                "current_commitment_signature",
+                "current_htlc_signatures"]:
+            v = binascii.unhexlify(v) if v is not None else None
+        elif len(self.path) > 2 and self.path[-2] in ['local_config', 'remote_config'] and key in ["pubkey", "privkey"]:
+            v = binascii.unhexlify(v) if v is not None else None
+        return v
 
     def append(self, addr):
         self[len(self)] = addr
@@ -1066,7 +1066,7 @@ class JsonDB(Logger):
 
     @profiler
     def _load_transactions(self):
-        self.data = StorageDict(self.data, self)
+        self.data = StorageDict(self.data, self, [])
         # references in self.data
         # TODO make all these private
         # txid -> address -> set of (prev_outpoint, value)
