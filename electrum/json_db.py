@@ -132,7 +132,7 @@ class StorageDict(dict):
             v = dict((k, FeeUpdate(**x)) for k, x in v.items())
         elif key == 'tx_fees':
             v = dict((k, TxFeesValue(*x)) for k, x in v.items())
-        elif key == 'prevout_by_scripthash':
+        elif key == 'prevouts_by_scripthash':
             v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in v.items())
         elif key == 'buckets':
             v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in v.items())
