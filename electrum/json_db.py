@@ -70,6 +70,8 @@ class TxFeesValue(NamedTuple):
     num_inputs: Optional[int] = None
 
 
+_RaiseKeyError = object() # singleton for no-default behavior
+
 class StorageDict(dict):
 
     def __init__(self, data, db):
@@ -120,6 +122,18 @@ class StorageDict(dict):
         key = self.convert_key(key)
         return dict.__contains__(self, key)
 
+    def pop(self, key, v=_RaiseKeyError):
+        key = self.convert_key(key)
+        if self.db:
+            self.db.set_modified(True)
+        if v is _RaiseKeyError:
+            return dict.pop(self, key)
+        return dict.pop(self, key, v)
+
+    def get(self, key, default=None):
+        key = self.convert_key(key)
+        return dict.get(self, key, default)
+
     def _convert_value(self, key, value):
         if key == 'local_config':
             v = LocalConfig(**dict(decodeAll(value, True)))
@@ -129,8 +143,6 @@ class StorageDict(dict):
             v = ChannelConstraints(**value)
         elif key == 'funding_outpoint':
             v = Outpoint(**dict(decodeAll(value, False)))
-        elif key == 'verified_tx3':
-            v = dict((k, TxMinedInfo(*x)) for k, x in value.items())
         elif key == 'transactions':
             v = dict((k, Transaction(x)) for k, x in value.items())
         elif key == 'adds':
@@ -909,11 +921,18 @@ class JsonDB(Logger):
 
     @locked
     def get_verified_tx(self, txid):
-        return self.verified_tx.get(txid)
+        if txid not in self.verified_tx:
+            return None
+        height, timestamp, txpos, header_hash = self.verified_tx[txid]
+        return TxMinedInfo(height=height,
+                           conf=None,
+                           timestamp=timestamp,
+                           txpos=txpos,
+                           header_hash=header_hash)
 
     @modifier
     def add_verified_tx(self, txid, info):
-        self.verified_tx[txid] = info
+        self.verified_tx[txid] = (info.height, info.timestamp, info.txpos, info.header_hash)
 
     @modifier
     def remove_verified_tx(self, txid):

@@ -156,7 +156,7 @@ class HTLCManager:
                 fee_update.ctn_local = self.ctn_latest(LOCAL) + 1
 
         # no need to keep local update raw msgs anymore, they have just been ACKed.
-        self.log['unacked_local_updates2'].pop(str(self.log[REMOTE]['ctn']), None)
+        self.log['unacked_local_updates2'].pop(self.log[REMOTE]['ctn'], None)
 
     def discard_unsigned_remote_updates(self):
         """Discard updates sent by the remote, that the remote itself
@@ -191,7 +191,6 @@ class HTLCManager:
             ctn_idx = self.ctn_latest(REMOTE)
         else:
             ctn_idx = self.ctn_latest(REMOTE) + 1
-        ctn_idx = str(ctn_idx)
         l = self.log['unacked_local_updates2'].get(ctn_idx, [])
         l.append(raw_update_msg.hex())
         self.log['unacked_local_updates2'][ctn_idx] = l

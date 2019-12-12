@@ -103,9 +103,9 @@ class FeeUpdate(StoredAttr):
 
 @attr.s
 class ChannelConstraints(StoredAttr):
-    capacity = attr.ib(int)
-    is_initiator = attr.ib(bool)
-    funding_txn_minimum_depth = attr.ib(int)
+    capacity = attr.ib(type=int)
+    is_initiator = attr.ib(type=bool)
+    funding_txn_minimum_depth = attr.ib(type=int)
 
 
 class ScriptHtlc(NamedTuple):
