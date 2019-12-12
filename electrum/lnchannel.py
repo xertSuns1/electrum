@@ -29,6 +29,7 @@ import json
 from enum import IntEnum
 from typing import Optional, Dict, List, Tuple, NamedTuple, Set, Callable, Iterable, Sequence, TYPE_CHECKING
 import time
+import threading
 
 from . import ecc
 from .util import bfh, bh2u
@@ -122,6 +123,7 @@ class Channel(Logger):
         self.lnworker = lnworker  # type: Optional[LNWallet]
         self.sweep_address = sweep_address
         self.storage = state
+        self.db_lock = self.storage.db.lock if self.storage.db else threading.RLock()
         self.config = {}
         self.config[LOCAL] = state["local_config"]
         self.config[REMOTE] = state["remote_config"]
@@ -191,12 +193,13 @@ class Channel(Logger):
         return out
 
     def open_with_first_pcp(self, remote_pcp, remote_sig):
-        self.config[REMOTE].current_per_commitment_point=remote_pcp
-        self.config[REMOTE].next_per_commitment_point=None
-        self.config[LOCAL].current_commitment_signature=remote_sig
-        self.hm.channel_open_finished()
-        self.peer_state = peer_states.GOOD
-        self.set_state(channel_states.OPENING)
+        with self.db_lock:
+            self.config[REMOTE].current_per_commitment_point=remote_pcp
+            self.config[REMOTE].next_per_commitment_point=None
+            self.config[LOCAL].current_commitment_signature=remote_sig
+            self.hm.channel_open_finished()
+            self.peer_state = peer_states.GOOD
+            self.set_state(channel_states.OPENING)
 
     def set_state(self, state):
         """ set on-chain state """
@@ -261,7 +264,8 @@ class Channel(Logger):
         self._check_can_pay(htlc.amount_msat)
         if htlc.htlc_id is None:
             htlc = htlc._replace(htlc_id=self.hm.get_next_htlc_id(LOCAL))
-        self.hm.send_htlc(htlc)
+        with self.db_lock:
+            self.hm.send_htlc(htlc)
         self.logger.info("add_htlc")
         return htlc
 
@@ -282,7 +286,8 @@ class Channel(Logger):
             raise RemoteMisbehaving('Remote dipped below channel reserve.' +\
                     f' Available at remote: {self.available_to_spend(REMOTE)},' +\
                     f' HTLC amount: {htlc.amount_msat}')
-        self.hm.recv_htlc(htlc)
+        with self.db_lock:
+            self.hm.recv_htlc(htlc)
         self.logger.info("receive_htlc")
         return htlc
 
@@ -328,9 +333,8 @@ class Channel(Logger):
             htlcsigs.append((ctx_output_idx, htlc_sig))
         htlcsigs.sort()
         htlcsigs = [x[1] for x in htlcsigs]
-
-        self.hm.send_ctx()
-
+        with self.db_lock:
+            self.hm.send_ctx()
         return sig_64, htlcsigs
 
     def receive_new_commitment(self, sig, htlc_sigs):
@@ -377,10 +381,10 @@ class Channel(Logger):
                              pcp=pcp,
                              ctx=pending_local_commitment,
                              ctx_output_idx=ctx_output_idx)
-
-        self.hm.recv_ctx()
-        self.config[LOCAL].current_commitment_signature=sig
-        self.config[LOCAL].current_htlc_signatures=htlc_sigs_string
+        with self.db_lock:
+            self.hm.recv_ctx()
+            self.config[LOCAL].current_commitment_signature=sig
+            self.config[LOCAL].current_htlc_signatures=htlc_sigs_string
 
     def verify_htlc(self, *, htlc: UpdateAddHtlc, htlc_sig: bytes, htlc_direction: Direction,
                     pcp: bytes, ctx: Transaction, ctx_output_idx: int) -> None:
@@ -410,7 +414,8 @@ class Channel(Logger):
         if not self.signature_fits(new_ctx):
             # this should never fail; as receive_new_commitment already did this test
             raise Exception("refusing to revoke as remote sig does not fit")
-        self.hm.send_rev()
+        with self.db_lock:
+            self.hm.send_rev()
         received = self.hm.received_in_ctn(new_ctn)
         sent = self.hm.sent_in_ctn(new_ctn)
         if self.lnworker:
@@ -432,11 +437,12 @@ class Channel(Logger):
         if cur_point != derived_point:
             raise Exception('revoked secret not for current point')
 
-        self.revocation_store.add_next_entry(revocation.per_commitment_secret)
-        ##### start applying fee/htlc changes
-        self.hm.recv_rev()
-        self.config[REMOTE].current_per_commitment_point=self.config[REMOTE].next_per_commitment_point
-        self.config[REMOTE].next_per_commitment_point=revocation.next_per_commitment_point
+        with self.db_lock:
+            self.revocation_store.add_next_entry(revocation.per_commitment_secret)
+            ##### start applying fee/htlc changes
+            self.hm.recv_rev()
+            self.config[REMOTE].current_per_commitment_point=self.config[REMOTE].next_per_commitment_point
+            self.config[REMOTE].next_per_commitment_point=revocation.next_per_commitment_point
 
     def balance(self, whose, *, ctx_owner=HTLCOwner.LOCAL, ctn=None):
         """
@@ -603,15 +609,18 @@ class Channel(Logger):
         htlc = log['adds'][htlc_id]
         assert htlc.payment_hash == sha256(preimage)
         assert htlc_id not in log['settles']
-        self.hm.recv_settle(htlc_id)
+        with self.db_lock:
+            self.hm.recv_settle(htlc_id)
 
     def fail_htlc(self, htlc_id):
         self.logger.info("fail_htlc")
-        self.hm.send_fail(htlc_id)
+        with self.db_lock:
+            self.hm.send_fail(htlc_id)
 
     def receive_fail_htlc(self, htlc_id):
         self.logger.info("receive_fail_htlc")
-        self.hm.recv_fail(htlc_id)
+        with self.db_lock:
+            self.hm.recv_fail(htlc_id)
 
     def pending_local_fee(self):
         return self.constraints.capacity - sum(x.value for x in self.get_next_commitment(LOCAL).outputs())
@@ -620,10 +629,11 @@ class Channel(Logger):
         # feerate uses sat/kw
         if self.constraints.is_initiator != from_us:
             raise Exception(f"Cannot update_fee: wrong initiator. us: {from_us}")
-        if from_us:
-            self.hm.send_update_fee(feerate)
-        else:
-            self.hm.recv_update_fee(feerate)
+        with self.db_lock:
+            if from_us:
+                self.hm.send_update_fee(feerate)
+            else:
+                self.hm.recv_update_fee(feerate)
 
     def make_commitment(self, subject, this_point, ctn) -> PartialTransaction:
         assert type(subject) is HTLCOwner

@@ -57,7 +57,6 @@ class WalletStorage(Logger):
 
     def __init__(self, path, *, manual_upgrades=False):
         Logger.__init__(self)
-        self.lock = threading.RLock()
         self.path = standardize_path(path)
         self._file_exists = bool(self.path and os.path.exists(self.path))
 
@@ -112,7 +111,7 @@ class WalletStorage(Logger):
 
     @profiler
     def write(self):
-        with self.lock:
+        with self.db.lock:
             self._write()
 
     def _write(self):
