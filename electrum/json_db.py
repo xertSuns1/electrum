@@ -73,13 +73,13 @@ class StorageDict(dict):
         # convert int, HTLCOwner to str
         return str(int(key)) if isinstance(key, int) else key
 
-    def modifier(func):
+    def locked(func):
         def wrapper(self, *args, **kwargs):
             with self.lock:
                 return func(self, *args, **kwargs)
         return wrapper
 
-    @modifier
+    @locked
     def __setitem__(self, key, v):
         key = self.convert_key(key)
         is_new = key not in self
@@ -103,22 +103,24 @@ class StorageDict(dict):
         if self.db:
             self.db.set_modified(True)
 
-    @modifier
+    @locked
     def __delitem__(self, key):
         key = self.convert_key(key)
         dict.__delitem__(self, key)
         if self.db:
             self.db.set_modified(True)
 
+    @locked
     def __getitem__(self, key):
         key = self.convert_key(key)
         return dict.__getitem__(self, key)
 
+    @locked
     def __contains__(self, key):
         key = self.convert_key(key)
         return dict.__contains__(self, key)
 
-    @modifier
+    @locked
     def pop(self, key, v=_RaiseKeyError):
         key = self.convert_key(key)
         if v is _RaiseKeyError:
@@ -129,6 +131,7 @@ class StorageDict(dict):
             self.db.set_modified(True)
         return r
 
+    @locked
     def get(self, key, default=None):
         key = self.convert_key(key)
         return dict.get(self, key, default)
@@ -181,43 +184,52 @@ class StorageList:
         self.path = path
         self.lock = self.db.lock if self.db else threading.RLock()
 
-    def to_json(self):
-        return dict(enumerate(self.l))
-
-    def modifier(func):
+    def locked(func):
         def wrapper(self, *args, **kwargs):
             with self.lock:
                 r = func(self, *args, **kwargs)
-                if self.db:
-                    self.db.set_modified(True)
                 return r
         return wrapper
 
+    @locked
+    def to_json(self):
+        return dict(enumerate(self.l))
+
+    @locked
     def __getitem__(self, key):
         return self.l.__getitem__(key)
 
+    @locked
     def __contains__(self, v):
         return self.l.__contains__(v)
 
+    @locked
     def __len__(self):
         return self.l.__len__()
 
+    @locked
     def count(self, v):
         return self.l.count(v)
 
-    @modifier
+    @locked
     def append(self, x):
         self.l.append(x)
+        if self.db:
+            self.db.set_modified(True)
 
-    @modifier
+    @locked
     def remove(self, x):
         self.l.remove(x)
+        if self.db:
+            self.db.set_modified(True)
 
-    @modifier
+    @locked
     def clear(self):
         self.l.clear()
+        if self.db:
+            self.db.set_modified(True)
 
-    @modifier
+    @locked
     def reverse(self):
         self.l.reverse()
 
