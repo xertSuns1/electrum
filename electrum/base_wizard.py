@@ -218,7 +218,7 @@ class BaseWizard(Logger):
     def on_import(self, text):
         # text is already sanitized by is_address_list and is_private_keys_list
         if keystore.is_address_list(text):
-            self.data['addresses'] = {}
+            self.data['imported_addresses'] = {}
             for addr in text.split():
                 assert bitcoin.is_address(addr)
                 self.data['imported_addresses'][addr] = {}
