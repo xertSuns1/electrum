@@ -116,8 +116,9 @@ class ScriptHtlc(NamedTuple):
 # FIXME duplicate of TxOutpoint in transaction.py??
 @attr.s
 class Outpoint(StoredAttr):
-    txid = attr.ib(str)
-    output_index = attr.ib(int)
+    txid = attr.ib(type=str)
+    output_index = attr.ib(type=int)
+
     def to_str(self):
         return "{}:{}".format(self.txid, self.output_index)
 
