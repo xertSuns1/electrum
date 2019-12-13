@@ -90,6 +90,7 @@ class StorageDict(dict):
         # _convert_dict is called breadth-first
         if isinstance(v, dict):
             v = self._convert_dict(key, v)
+        if isinstance(v, dict):
             v = StorageDict(v, self.db, self.path + [key])
         # convert_value is called depth-first
         if isinstance(v, dict) or isinstance(v, str):
@@ -110,11 +111,8 @@ class StorageDict(dict):
             self.db.set_modified(True)
 
     def __getitem__(self, key):
-        if isinstance(key, slice):
-            return self.get_slice(key)
-        else:
-            key = self.convert_key(key)
-            return dict.__getitem__(self, key)
+        key = self.convert_key(key)
+        return dict.__getitem__(self, key)
 
     def __contains__(self, key):
         key = self.convert_key(key)
@@ -148,6 +146,8 @@ class StorageDict(dict):
             v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in v.items())
         elif key == 'buckets':
             v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in v.items())
+        elif key in ['change_addresses', 'receiving_addresses']:
+            v = StorageList(v, self.db, self.path + [key])
         return v
 
     def _convert_value(self, key, v):
@@ -173,16 +173,54 @@ class StorageDict(dict):
             v = binascii.unhexlify(v) if v is not None else None
         return v
 
-    def append(self, addr):
-        self[len(self)] = addr
+class StorageList:
 
-    def get_slice(self, _slice):
-        n = len(self)
-        slice_start = _slice.start or 0
-        if slice_start < 0: slice_start = slice_start % n
-        slice_stop = _slice.stop or n
-        if slice_stop < 0: slice_stop = slice_stop % n
-        return [self[i] for i in range(slice_start, slice_stop)]
+    def __init__(self, data, db, path):
+        self.l = [data[str(i)] for i in range(len(data))]
+        self.db = db
+        self.path = path
+        self.lock = self.db.lock if self.db else threading.RLock()
+
+    def to_json(self):
+        return dict(enumerate(self.l))
+
+    def modifier(func):
+        def wrapper(self, *args, **kwargs):
+            with self.lock:
+                r = func(self, *args, **kwargs)
+                if self.db:
+                    self.db.set_modified(True)
+                return r
+        return wrapper
+
+    def __getitem__(self, key):
+        return self.l.__getitem__(key)
+
+    def __contains__(self, v):
+        return self.l.__contains__(v)
+
+    def __len__(self):
+        return self.l.__len__()
+
+    def count(self, v):
+        return self.l.count(v)
+
+    @modifier
+    def append(self, x):
+        self.l.append(x)
+
+    @modifier
+    def remove(self, x):
+        self.l.remove(x)
+
+    @modifier
+    def clear(self):
+        self.l.clear()
+
+    @modifier
+    def reverse(self):
+        self.l.reverse()
+
 
 
 class JsonDB(Logger):
@@ -1071,9 +1109,9 @@ class JsonDB(Logger):
             self.change_addresses = self.get_dict('change_addresses')
             self.receiving_addresses = self.get_dict('receiving_addresses')
             self._addr_to_addr_index = {}  # type: Dict[str, Sequence[int]]  # key: address, value: (is_change, index)
-            for i, addr in self.receiving_addresses.items():
+            for i, addr in enumerate(self.receiving_addresses):
                 self._addr_to_addr_index[addr] = (0, int(i))
-            for i, addr in self.change_addresses.items():
+            for i, addr in enumerate(self.change_addresses):
                 self._addr_to_addr_index[addr] = (1, int(i))
 
     @profiler
