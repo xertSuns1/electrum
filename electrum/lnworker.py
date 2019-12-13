@@ -1266,6 +1266,7 @@ class LNWallet(LNWorker):
         assert chan.is_closed()
         with self.lock:
             self.channels.pop(chan_id)
+            self.channel_timestamps.pop(chan_id.hex())
             self.storage.get('channels').pop(chan_id.hex())
 
         self.network.trigger_callback('channels_updated', self.wallet)
