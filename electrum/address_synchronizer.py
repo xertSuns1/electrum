@@ -40,7 +40,7 @@ from .logging import Logger
 
 if TYPE_CHECKING:
     from .network import Network
-    from .json_db import JsonDB
+    from .json_db import WalletDB
 
 
 TX_HEIGHT_FUTURE = -3
@@ -70,7 +70,7 @@ class AddressSynchronizer(Logger):
     inherited by wallet
     """
 
-    def __init__(self, db: 'JsonDB'):
+    def __init__(self, db: 'WalletDB'):
         self.db = db
         self.network = None  # type: Network
         Logger.__init__(self)

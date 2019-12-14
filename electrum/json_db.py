@@ -38,7 +38,7 @@ from .transaction import Transaction, TxOutpoint, PartialTxOutput
 from .logging import Logger
 from .lnutil import LOCAL, REMOTE, FeeUpdate, UpdateAddHtlc, LocalConfig, RemoteConfig, Keypair, OnlyPubkeyKeypair, RevocationStore
 from .lnutil import ChannelConstraints, Outpoint, ShachainElement
-from .lnutil import StoredAttr
+from .db import StorageDict, StorageList, JsonDB, locked, modifier
 
 # seed_version is now used for the version of the wallet file
 
@@ -48,200 +48,16 @@ FINAL_SEED_VERSION = 23     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
-JsonDBJsonEncoder = util.MyEncoder
-
-
 class TxFeesValue(NamedTuple):
     fee: Optional[int] = None
     is_calculated_by_us: bool = False
     num_inputs: Optional[int] = None
 
 
-_RaiseKeyError = object() # singleton for no-default behavior
-
-class StorageDict(dict):
-
-    def __init__(self, data, db, path):
-        self.db = db
-        self.lock = self.db.lock if self.db else threading.RLock()
-        self.path = path
-        # recursively convert dicts to storagedict
-        for k, v in list(data.items()):
-            self.__setitem__(k, v)
-
-    def convert_key(self, key):
-        # convert int, HTLCOwner to str
-        return str(int(key)) if isinstance(key, int) else key
-
-    def locked(func):
-        def wrapper(self, *args, **kwargs):
-            with self.lock:
-                return func(self, *args, **kwargs)
-        return wrapper
-
-    @locked
-    def __setitem__(self, key, v):
-        key = self.convert_key(key)
-        is_new = key not in self
-        # early return to prevent unnecessary disk writes
-        if not is_new and self[key] == v:
-            return
-        # recursively convert dict to StorageDict.
-        # _convert_dict is called breadth-first
-        if isinstance(v, dict):
-            v = self._convert_dict(key, v)
-        if isinstance(v, dict):
-            v = StorageDict(v, self.db, self.path + [key])
-        # convert_value is called depth-first
-        if isinstance(v, dict) or isinstance(v, str):
-            v = self._convert_value(key, v)
-        # set parent of StoredAttr
-        if isinstance(v, StoredAttr):
-            v.set_db(self.db)
-        # set item
-        dict.__setitem__(self, key, v)
-        if self.db:
-            self.db.set_modified(True)
-
-    @locked
-    def __delitem__(self, key):
-        key = self.convert_key(key)
-        dict.__delitem__(self, key)
-        if self.db:
-            self.db.set_modified(True)
-
-    @locked
-    def __getitem__(self, key):
-        key = self.convert_key(key)
-        return dict.__getitem__(self, key)
-
-    @locked
-    def __contains__(self, key):
-        key = self.convert_key(key)
-        return dict.__contains__(self, key)
-
-    @locked
-    def pop(self, key, v=_RaiseKeyError):
-        key = self.convert_key(key)
-        if v is _RaiseKeyError:
-            r = dict.pop(self, key)
-        else:
-            r = dict.pop(self, key, v)
-        if self.db:
-            self.db.set_modified(True)
-        return r
-
-    @locked
-    def get(self, key, default=None):
-        key = self.convert_key(key)
-        return dict.get(self, key, default)
-
-    def _convert_dict(self, key, v):
-        if key == 'transactions':
-            v = dict((k, Transaction(x)) for k, x in v.items())
-        elif key == 'adds':
-            v = dict((k, UpdateAddHtlc(*x)) for k, x in v.items())
-        elif key == 'fee_updates':
-            v = dict((k, FeeUpdate(**x)) for k, x in v.items())
-        elif key == 'tx_fees':
-            v = dict((k, TxFeesValue(*x)) for k, x in v.items())
-        elif key == 'prevouts_by_scripthash':
-            v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in v.items())
-        elif key == 'buckets':
-            v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in v.items())
-        elif key in ['change_addresses', 'receiving_addresses']:
-            v = StorageList(v, self.db, self.path + [key])
-        return v
-
-    def _convert_value(self, key, v):
-        if key == 'local_config':
-            v = LocalConfig(**v)
-        elif key == 'remote_config':
-            v = RemoteConfig(**v)
-        elif key == 'constraints':
-            v = ChannelConstraints(**v)
-        elif key == 'funding_outpoint':
-            v = Outpoint(**v)
-        elif key.endswith("_basepoint") or key.endswith("_key"):
-            v = Keypair(**v) if len(v)==2 else OnlyPubkeyKeypair(**v)
-        elif key in [
-                "short_channel_id",
-                "current_per_commitment_point",
-                "next_per_commitment_point",
-                "per_commitment_secret_seed",
-                "current_commitment_signature",
-                "current_htlc_signatures"]:
-            v = binascii.unhexlify(v) if v is not None else None
-        elif len(self.path) > 2 and self.path[-2] in ['local_config', 'remote_config'] and key in ["pubkey", "privkey"]:
-            v = binascii.unhexlify(v) if v is not None else None
-        return v
-
-class StorageList:
-
-    def __init__(self, data, db, path):
-        self.l = [data[str(i)] for i in range(len(data))]
-        self.db = db
-        self.path = path
-        self.lock = self.db.lock if self.db else threading.RLock()
-
-    def locked(func):
-        def wrapper(self, *args, **kwargs):
-            with self.lock:
-                r = func(self, *args, **kwargs)
-                return r
-        return wrapper
-
-    @locked
-    def to_json(self):
-        return dict(enumerate(self.l))
-
-    @locked
-    def __getitem__(self, key):
-        return self.l.__getitem__(key)
-
-    @locked
-    def __contains__(self, v):
-        return self.l.__contains__(v)
-
-    @locked
-    def __len__(self):
-        return self.l.__len__()
-
-    @locked
-    def count(self, v):
-        return self.l.count(v)
-
-    @locked
-    def append(self, x):
-        self.l.append(x)
-        if self.db:
-            self.db.set_modified(True)
-
-    @locked
-    def remove(self, x):
-        self.l.remove(x)
-        if self.db:
-            self.db.set_modified(True)
-
-    @locked
-    def clear(self):
-        self.l.clear()
-        if self.db:
-            self.db.set_modified(True)
-
-    @locked
-    def reverse(self):
-        self.l.reverse()
-
-
-
-class JsonDB(Logger):
+class WalletDB(JsonDB):
 
     def __init__(self, raw, *, manual_upgrades):
-        Logger.__init__(self)
-        self.lock = threading.RLock()
-        self.data = {}
-        self._modified = False
+        JsonDB.__init__(self, {})
         self.manual_upgrades = manual_upgrades
         self._called_after_upgrade_tasks = False
         if raw:  # loading existing db
@@ -249,54 +65,6 @@ class JsonDB(Logger):
         else:  # creating new db
             self.put('seed_version', FINAL_SEED_VERSION)
             self._after_upgrade_tasks()
-
-    def set_modified(self, b):
-        with self.lock:
-            self._modified = b
-
-    def modified(self):
-        return self._modified
-
-    def modifier(func):
-        def wrapper(self, *args, **kwargs):
-            with self.lock:
-                self._modified = True
-                return func(self, *args, **kwargs)
-        return wrapper
-
-    def locked(func):
-        def wrapper(self, *args, **kwargs):
-            with self.lock:
-                return func(self, *args, **kwargs)
-        return wrapper
-
-    @locked
-    def get(self, key, default=None):
-        v = self.data.get(key)
-        if v is None:
-            v = default
-        return v
-
-    @modifier
-    def put(self, key, value):
-        try:
-            json.dumps(key, cls=JsonDBJsonEncoder)
-            json.dumps(value, cls=JsonDBJsonEncoder)
-        except:
-            self.logger.info(f"json error: cannot save {repr(key)} ({repr(value)})")
-            return False
-        if value is not None:
-            if self.data.get(key) != value:
-                self.data[key] = copy.deepcopy(value)
-                return True
-        elif key in self.data:
-            self.data.pop(key)
-            return True
-        return False
-
-    @locked
-    def dump(self):
-        return json.dumps(self.data, indent=4, sort_keys=True, cls=JsonDBJsonEncoder)
 
     def load_data(self, s):
         try:
@@ -1173,3 +941,43 @@ class JsonDB(Logger):
         self.history.clear()
         self.verified_tx.clear()
         self.tx_fees.clear()
+
+    def _convert_dict(self, path, key, v):
+        if key == 'transactions':
+            v = dict((k, Transaction(x)) for k, x in v.items())
+        elif key == 'adds':
+            v = dict((k, UpdateAddHtlc(*x)) for k, x in v.items())
+        elif key == 'fee_updates':
+            v = dict((k, FeeUpdate(**x)) for k, x in v.items())
+        elif key == 'tx_fees':
+            v = dict((k, TxFeesValue(*x)) for k, x in v.items())
+        elif key == 'prevouts_by_scripthash':
+            v = dict((k, {(prevout, value) for (prevout, value) in x}) for k, x in v.items())
+        elif key == 'buckets':
+            v = dict((k, ShachainElement(bfh(x[0]), int(x[1]))) for k, x in v.items())
+        return v
+
+    def _convert_value(self, path, key, v):
+        if key == 'local_config':
+            v = LocalConfig(**v)
+        elif key in ['change_addresses', 'receiving_addresses']:
+            v = StorageList(v, self, path + [key])
+        elif key == 'remote_config':
+            v = RemoteConfig(**v)
+        elif key == 'constraints':
+            v = ChannelConstraints(**v)
+        elif key == 'funding_outpoint':
+            v = Outpoint(**v)
+        elif key.endswith("_basepoint") or key.endswith("_key"):
+            v = Keypair(**v) if len(v)==2 else OnlyPubkeyKeypair(**v)
+        elif key in [
+                "short_channel_id",
+                "current_per_commitment_point",
+                "next_per_commitment_point",
+                "per_commitment_secret_seed",
+                "current_commitment_signature",
+                "current_htlc_signatures"]:
+            v = binascii.unhexlify(v) if v is not None else None
+        elif len(path) > 2 and path[-2] in ['local_config', 'remote_config'] and key in ["pubkey", "privkey"]:
+            v = binascii.unhexlify(v) if v is not None else None
+        return v

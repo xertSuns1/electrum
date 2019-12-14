@@ -34,7 +34,7 @@ from . import ecc
 from .util import profiler, InvalidPassword, WalletFileException, bfh, standardize_path
 from .plugin import run_hook, plugin_loaders
 
-from .json_db import JsonDB
+from .json_db import WalletDB
 from .logging import Logger
 
 
@@ -60,7 +60,7 @@ class WalletStorage(Logger):
         self.path = standardize_path(path)
         self._file_exists = bool(self.path and os.path.exists(self.path))
 
-        DB_Class = JsonDB
+        DB_Class = WalletDB
         self.logger.info(f"wallet path {self.path}")
         self.pubkey = None
         self._test_read_write_permissions(self.path)
@@ -209,7 +209,7 @@ class WalletStorage(Logger):
             s = None
         self.pubkey = ec_key.get_public_key_hex()
         s = s.decode('utf8')
-        self.db = JsonDB(s, manual_upgrades=True)
+        self.db = WalletDB(s, manual_upgrades=True)
         self.load_plugins()
 
     def encrypt_before_writing(self, plaintext: str) -> str:

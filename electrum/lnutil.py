@@ -38,22 +38,7 @@ LN_MAX_FUNDING_SAT = pow(2, 24) - 1
 def ln_dummy_address():
     return redeem_script_to_address('p2wsh', '')
 
-class StoredAttr:
-    db = None
-
-    def __setattr__(self, key, value):
-        if self.db:
-            self.db.set_modified(True)
-        object.__setattr__(self, key, value)
-
-    def set_db(self, db):
-        self.db = db
-
-    def to_json(self):
-        d = dict(vars(self))
-        d.pop('db', None)
-        return d
-
+from .db import StoredAttr
 
 @attr.s
 class OnlyPubkeyKeypair(StoredAttr):

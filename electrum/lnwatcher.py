@@ -13,7 +13,7 @@ from enum import IntEnum, auto
 from typing import NamedTuple, Dict
 
 from .sql_db import SqlDB, sql
-from .json_db import JsonDB
+from .json_db import WalletDB
 from .util import bh2u, bfh, log_exceptions, ignore_exceptions
 from . import wallet
 from .storage import WalletStorage
@@ -140,7 +140,7 @@ class LNWatcher(AddressSynchronizer):
     LOGGING_SHORTCUT = 'W'
 
     def __init__(self, network: 'Network'):
-        AddressSynchronizer.__init__(self, JsonDB({}, manual_upgrades=False))
+        AddressSynchronizer.__init__(self, WalletDB({}, manual_upgrades=False))
         self.config = network.config
         self.channels = {}
         self.network = network
